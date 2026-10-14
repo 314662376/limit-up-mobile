@@ -563,48 +563,52 @@
   function clsRate(p) { return p == null ? 'flat' : (p >= 60 ? 'up' : (p <= 40 ? 'down' : 'flat')); }
   function pctOf(v) { return (v == null || !isFinite(v)) ? '--' : v.toFixed(2) + '%'; }
 
-  /* 把「今日实时非一字板封板率」贴在 ①② 两个数值后面。
-   * 全部统一到【非一字板】口径 —— 与 ①② 两个公式的权重口径一致，也和①/②的昨日基准一致。
-   * （今日总封板率不再出现在这里，只在顶部 meta 行留作参考。）
+  /* ---- 第三个数字：**今日实时**非一字板封板率 ----
+   * 唯一的算式明细放 title（长按可见），页面上只有一个百分比。
    *
-   * ⚠ 唯一要留意的：贴的这两个数是「今天」的，而 ①② 公式用的是「昨天」的基准
-   *   （顶部 meta 行那两行）。两组数常在同一量级、看着像同一个东西，
-   *   所以给鼠标悬停补一份完整算式（title 属性，不占任何可见空间）并列出昨日基准做对照。
+   * ⚠ 这里绝对不能退到存档。存档（含 latest.json）给的是**上一个交易日**的家数，
+   *   挂在「今天」的位置上就是错的 —— 而且错得不显眼（两个数常在同一量级）。
+   *   所以判据是「这批数据真的属于今天」，不属于就显示 -- 。
    */
-  function rateTip(which, today, base) {
-    var L = ['今日实时 · 非一字板封板率（' + which + ' 后面这个数）'];
-    if (today && today.fbl != null) {
-      L.push('= 非一字板 ' + today.base + ' 家 ÷ (非一字板 ' + today.base + ' + 炸板 ' + today.zb + ' 家)');
-      L.push('= ' + today.base + '/' + (today.base + today.zb) + ' = ' + today.fbl.toFixed(2) + '%');
-      L.push('（非一字板 = 涨停 ' + today.zt + ' − 一字板 ' + today.oneWord + '）');
-    } else if (today) {
-      L.push('当日全是一字板（非一字板 0 家），分母为 0，无法计算');
+  function rateTip(t, fromLive) {
+    var L = ['今日' + (fromLive ? '实时' : '（收盘定格）') + '非一字板封板率'];
+    if (t.fbl != null) {
+      L.push('非一字板 ' + t.base + ' ÷ （非一字板 ' + t.base + ' + 炸板 ' + t.zb + '） = ' +
+        t.base + '/' + (t.base + t.zb) + ' = ' + t.fbl.toFixed(2) + '%');
+      L.push('非一字板 = 涨停 ' + t.zt + ' − 一字板 ' + t.oneWord);
+      var tot = t.zt + t.zb;
+      L.push('总口径（含一字板）：' + t.zt + '/' + tot + ' = ' +
+        (tot > 0 ? (t.zt / tot * 100).toFixed(2) + '%' : '--'));
     } else {
-      L.push('暂未取到今日数据');
+      L.push('当日全是一字板（非一字板 0 家），分母为 0，无法计算');
     }
     L.push('数据源：同花顺涨停池 / 炸板池（filter=HS,GEM2STAR）');
-    if (base && base.fbl != null) {
-      L.push('—— 对照：①② 两个公式用的都是「昨日」' + base.date + ' 的非一字板封板率 ' + base.fbl.toFixed(2) + '%');
-    }
-    L.push('（盘中实时累加，收盘定格为当日终值）');
+    L.push(fromLive ? '盘中实时累加，收盘定格为当日终值' : '涨停池接口取不到，用的是当日归档里已定格的终值');
     return L.join('\n');
   }
 
-  function renderTodayRate(t) {
-    var base = state.rate;
-    // ①② 后面挂的都是今日非一字板封板率（同一口径、同一个数）
-    var items = [
-      ['curRate', t ? t.fbl : null, rateTip('①', t, base)],
-      ['curRate2', t ? t.fbl : null, rateTip('②', t, base)]
-    ];
-    for (var i = 0; i < items.length; i++) {
-      var e = document.getElementById(items[i][0]);
-      if (!e) continue;
-      var v = items[i][1];
-      e.textContent = (v == null) ? '--' : ('封板率 ' + v.toFixed(2) + '%');
-      e.className = 'r ' + clsRate(v);
-      e.title = items[i][2];
+  async function renderTodayRate(t) {
+    var todayNum = ymdOfBJ(bjNow());
+    var live = (t && String(t.date) === String(todayNum)) ? t : null;
+    var fromLive = !!live;
+
+    // 池子接口不可用时的第二条路：**今天自己**那份归档里的 self。
+    // 严格认 self.date === 今天 —— 归档的 rate 装的是前一个交易日的家数，绝不能用
+    // （那正是这个数字第一次写错的原因）。
+    if (!live) {
+      try {
+        var d = await getArchive(fmtDateNum(String(todayNum)));
+        if (d && d.self && String(d.self.date) === String(todayNum)) live = d.self;
+      } catch (e) { /* 忽略，显示 -- */ }
     }
+
+    var e = document.getElementById('curRate');
+    if (!e) return;
+    var v = live ? live.fbl : null;
+    e.textContent = (v == null) ? '--' : v.toFixed(2) + '%';
+    e.className = 'v ' + clsRate(v);
+    e.title = live ? rateTip(live, fromLive)
+      : '今日实时非一字板封板率：暂未取到（涨停池 / 炸板池接口不可达，或今日还没有数据）';
   }
 
   async function loadHistory() {
@@ -1304,24 +1308,9 @@
       if (chartDays.length > DAYS_5D) chartDays = chartDays.slice(-DAYS_5D);
       state.chartDays = chartDays;
 
-      if (rate) {
-        var tag = rate.src === 'live' ? '' : '［存档］';
-        // 手机版第三个数字：只显示百分比本身。
-        // 口径细节挪到 title（长按可见），版面上一律不出现说明文字。
-        var fblTxt = rate.fbl == null ? '　' : rate.fbl.toFixed(2) + '%';
-        setText('fblText', fblTxt);
-        var fbEl = document.getElementById('fblText');
-        if (fbEl) {
-          fbEl.title = '昨日非一字板封板率 ' + fblTxt +
-            '（' + rate.base + '/' + (rate.base + rate.zb) +
-            '，剔除一字板 ' + rate.oneWord + ' 家，炸板率 ' +
-            (rate.zbl == null ? '--' : rate.zbl.toFixed(2) + '%') +
-            '，基准日 ' + rate.date + '）' + tag;
-          fbEl.className = 'v ' + clsRate(rate.fbl) + (tag ? ' stale' : '');
-        }
-      } else {
-        setText('fblText', '　');
-      }
+      // 这里原本把「昨日非一字板封板率」写到 fblText 上，已改掉：
+      // 页面上第三个数字要的是**今天实时**的封板率（见 renderTodayRate），
+      // 昨日基准只是 ①② 的输入，手机上不再单独占位置。
 
       // 顶部数值统一取「三个输入量都齐」的最后一个点，避免 883918 比分时慢一拍时出现空值。
       // 若 883918 整段缺失，则退回到只要求 883900 + 上证（此时指数②显示 --）。
@@ -1373,8 +1362,8 @@
         setText('lastPoint', last.t + (lastAll && lastAll.t !== last.t ? '（883918 到 ' + lastAll.t + '）' : ''));
       }
 
-      // 今日实时封板率：贴在 ①② 数值后面（已在上面取过，这里只负责渲染）
-      renderTodayRate(todayLive);
+      // 第三个数字：今日实时（或当日归档定格）的非一字板封板率
+      await renderTodayRate(todayLive);
 
       // 按当前选中的视图（1日 / 5日）绘制两张图
       renderAll();
