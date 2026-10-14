@@ -22,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 
 const OWNER = '314662376';
-const REPO = 'limit-up-sentiment';
+const REPO = 'limit-up-mobile';
 const BRANCH = 'main';
 const API = 'https://api.github.com';
 
