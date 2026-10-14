@@ -1,0 +1,1551 @@
+(function () {
+  'use strict';
+
+  /* ============================================================
+   * 两个指数
+   *  ★ 两个公式统一用「昨日非一字板封板率」做权重，不再用「昨日总封板率」。
+   *    理由：一字板买不到，对打板策略没有可实现性；非一字板口径才是这套收益模型的基础。
+   *    （总封板率仍显示在顶部 meta 行，但只作参考，不参与任何计算。）
+   *
+   *  ① 涨停情绪指数（无量纲，1.000 = 中性）
+   *     值 = 昨日非一字板封板率/100 × (883900涨跌幅% ÷ 100) + 1 + 上证涨跌幅% ÷ 20
+   *     Excel 式 =C3/100*D3+1+E3/20          → y 轴固定 0.925 ~ 1.075
+   *                                             （跌破 0.95 的线段标红、涨破 1.05 的标绿）
+   *
+   *  ② 打板收益（元 / 万元本金，0 = 不赚不亏）
+   *     值 = 10000*(1+883918%)*昨日炸板率 + 10000*(1+883900%)*昨日非一字板封板率 − 10000
+   *     Excel 式 =10000*(1+F2)*E2+10000*(1+D2)*C2-10000
+   *     条件：昨日非一字板封板率(C) + 昨日炸板率(E) = 100%，故等价于
+   *     值 = 100 × ( 883918% × 炸板率 + 883900% × 非一字板封板率 )
+   *     → y 轴固定 −200 ~ 300
+   *       （跌破 −100 的线段标红、涨破 200 的标绿）
+   * ============================================================ */
+  var BASE = 'https://d.10jqka.com.cn';
+  // 历史归档直接读「电脑版」项目在 GitHub Pages 上的 data/ ——
+  // GitHub Pages 对所有静态资源都发 Access-Control-Allow-Origin: *，浏览器可以跨域取。
+  // 这样两个项目共用同一份数据、只跑一套采集任务，手机版不需要自己再采一遍。
+  var DATA_BASE = 'https://314662376.github.io/limit-up-sentiment/data/';
+  var REFRESH_SEC = 60;
+  var DAYS_5D = 5;
+  // 5 日图「每天一色」的调色板：刻意避开纯红 / 纯绿，
+  // 因为红=跌破下阈、绿=涨破上阈，日期色不该和警示色抢同一套语义。
+  var COLORS = ['#2f6bd8', '#7b61c9', '#0d8ba6', '#c08a2e', '#6b7a8f'];
+
+  // 指数①：y 轴固定区间（0.925 ~ 1.075，7 条刻度，0.95 / 1.05 刚好落在刻度上）
+  var Y_MIN = 0.925, Y_MAX = 1.075, Y_STEP = 0.025, Y_BASE = 1;
+  // 指数②：y 轴固定区间（-200 ~ 300，6 条刻度，-100 / 200 刚好落在刻度上）
+  var Y2_MIN = -200, Y2_MAX = 300, Y2_STEP = 100, Y2_BASE = 0;
+
+  /* 超阈区间警示色：跌破下阈 = 红，涨破上阈 = 绿（沿用 A 股「红跌绿涨」之外的
+   * 「危险 = 红 / 安全 = 绿」语义，两处阈值由用户指定）
+   *   ① 区间 0.95 ~ 1.05（中性基准 1.000）
+   *   ② 区间 -100 ~ 200（中性基准 0）        */
+  var TH1_LO = 0.95, TH1_HI = 1.05;
+  var TH2_LO = -100, TH2_HI = 200;
+  var C_RED = '#d93025', C_GREEN = '#0f9d58';
+  var C_BASE = '#8b929c';            // 中性基准线（灰）
+
+  var charts = {};
+  var left = REFRESH_SEC;
+  var busy = false;
+
+  /* ==================== 通用工具 ==================== */
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function setText(id, t) { var e = document.getElementById(id); if (e) e.textContent = t; }
+  function num(v) { var n = parseFloat(v); return isFinite(n) ? n : null; }
+  function cls1(v) { return v > 1.0000001 ? 'up' : (v < 0.9999999 ? 'down' : 'flat'); }
+  function cls2(v) { return v > 0.004 ? 'up' : (v < -0.004 ? 'down' : 'flat'); }
+  function fmtT(s) { s = String(s); return s.length === 4 ? s.slice(0, 2) + ':' + s.slice(2) : s; }
+  function fmtPct(v) { var n = num(v); return n === null ? '--' : (n > 0 ? '+' : '') + n.toFixed(2) + '%'; }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  /* ---- 窄屏参数 ----
+   * 本页是「单列、最宽 520px」的手机版：无论窗口多宽，图表永远是窄的，
+   * 所以这一项恒为 true（电脑版才需要按窗口宽度切换两套参数）。
+   * 它控制的是 ECharts 的绘图区留白、刻度字号、5 日图标签密度 —— 这些按像素算，
+   * 沿用桌面的 64px 左边距 + 每天 4 个时刻标签会挤成一团。
+   */
+  function isNarrow() { return true; }
+  function chartGrid() {
+    return { left: 43, right: 18, top: 16, bottom: 24 };
+  }
+
+  /* 交易日的几个关键时刻（北京时间，单位=当日分钟数） */
+  var AUCTION_START = 9 * 60 + 15;   // 555  集合竞价开始
+  var AUCTION_END = 9 * 60 + 25;     // 565  集合竞价撮合完成 → 开盘价已定，今日行情从这里算起
+  var OPEN_MIN = 9 * 60 + 30;        // 570  连续竞价开始
+  var CLOSE_MIN = 15 * 60;           // 900  收盘
+
+  // 完整交易日的分钟刻度：09:25（集合竞价撮合点）+ 09:30-11:30 + 13:00-15:00，午休不占位。
+  // 两张图的当日分时都用这一整套横轴，盘中不随实时数据向右延长。
+  // 09:25 这个点只有「当天实时」拿得到（见 fetchOpeningRow），存档里没有，所以历史日的首位是空的。
+  var DAY_TICKS = (function () {
+    var a = ['09:25'];
+    function run(h0, m0, h1, m1) {
+      for (var c = h0 * 60 + m0, e = h1 * 60 + m1; c <= e; c++) {
+        a.push(pad(Math.floor(c / 60)) + ':' + pad(c % 60));
+      }
+    }
+    run(9, 30, 11, 30);
+    run(13, 0, 15, 0);
+    return a;
+  })();
+  var DAY_TICK_SET = {};
+  DAY_TICKS.forEach(function (t) { DAY_TICK_SET[t] = 1; });
+
+  // 当日图 x 轴只标这几个时刻，避免 243 个标签挤在一起
+  // （09:25 刻意不标：它和 09:30 只差一格，两个标签会压在一起）
+  var DAY_LABELS = {
+    '09:30': 1, '10:00': 1, '10:30': 1, '11:00': 1,
+    '13:00': 1, '13:30': 1, '14:00': 1, '14:30': 1, '15:00': 1
+  };
+
+  /* ============================================================
+   * 5 日图横轴：5 个交易日「按顺序连续铺开」
+   *   每天占 DAY_TICKS.length 个刻度（共 5×242），而不是把 5 天
+   *   折回同一个 09:30–15:00 的日内轴上叠着画。
+   *
+   * 为什么刻度名必须带日期前缀：category 轴是按「名字」匹配数据的。
+   * 若 5 天都用 '09:30' 这种名字，ECharts 会把相同名字归并成同一个
+   * x 位置 → 5 天的曲线全部叠在一起，正是要改掉的那个效果。
+   * 所以刻度名统一为 '1008|09:30' 这种「MMDD|HH:MM」，全局唯一。
+   * ============================================================ */
+  var DAY_LABELS_5D = { '10:30': 1, '13:30': 1, '15:00': 1 };
+  /* 手机上每天 4 个标签 × 5 天 = 20 个，挤在 ~330px 的绘图区里会互相压住，
+   * 所以窄屏只留每天收盘那一个时刻（加上开盘处的日期，每天 2 个 → 共 10 个）。 */
+  var DAY_LABELS_5D_NARROW = { '15:00': 1 };
+  function day5dLabels() { return isNarrow() ? DAY_LABELS_5D_NARROW : DAY_LABELS_5D; }
+
+  // '2026-10-08' / '20261008' → '1008'
+  function mmddOf(d) {
+    var s = String(d == null ? '' : d).replace(/-/g, '');
+    if (s.length >= 8) return s.slice(4, 8);
+    return s.length === 4 ? s : '';
+  }
+  function dashMMDD(m) { return m.length === 4 ? m.slice(0, 2) + '-' + m.slice(2) : m; }
+  // '20260930' → '09-30'（图例里标注「基准日」用）
+  function fmtBaseDay(n) {
+    var s = String(n == null ? '' : n);
+    return s.length === 8 ? s.slice(4, 6) + '-' + s.slice(6, 8) : s;
+  }
+
+  // 构造 5 日连续刻度；start[i] = 第 i 天在刻度数组里的起始下标
+  function build5dTicks(days) {
+    var a = [], start = [];
+    days.forEach(function (day) {
+      start.push(a.length);
+      var p = mmddOf(day.date);
+      for (var i = 0; i < DAY_TICKS.length; i++) a.push(p + '|' + DAY_TICKS[i]);
+    });
+    return { ticks: a, start: start };
+  }
+
+  // 5 日横轴标签：每天开盘处标「日期」，其余只标少数时刻（5×242 个标签会糊成一片）
+  function label5dOf(v) {
+    var s = String(v), i = s.indexOf('|');
+    if (i < 0) return null;
+    var m = s.slice(0, i), t = s.slice(i + 1);
+    // 每天的第一格标日期（现在是 09:25，因为 DAY_TICKS 从集合竞价撮合点起算）
+    if (t === '09:25') return { text: dashMMDD(m), date: true };
+    if (day5dLabels()[t]) return { text: t, date: false };
+    return null;
+  }
+
+  // '1008|09:30' → '10-08 09:30'（tooltip 用）
+  function fmtKey5d(v) {
+    var s = String(v), i = s.indexOf('|');
+    if (i < 0) return s;
+    return dashMMDD(s.slice(0, i)) + ' ' + s.slice(i + 1);
+  }
+
+  // 交易日之间的竖向分隔虚线（挂到 series[0] 的 markLine 上，与阈值虚线一起渲染）
+  function daySepLines5d(ticks, start) {
+    var out = [];
+    for (var i = 1; i < start.length; i++) {
+      out.push({
+        xAxis: ticks[start[i]],
+        lineStyle: { color: '#c9ced6', type: 'dotted', width: 1, opacity: .9 },
+        label: { show: false }
+      });
+    }
+    return out;
+  }
+
+  // 超出固定 y 轴区间的点数（区间是硬约束，超出的点会被裁掉，用提示兜底）
+  function countOut(values, min, max) {
+    var n = 0;
+    for (var i = 0; i < values.length; i++) {
+      var v = values[i];
+      if (typeof v === 'number' && isFinite(v) && (v < min || v > max)) n++;
+    }
+    return n;
+  }
+
+  /* 指数①：涨跌幅以「小数」代入。
+   * ratePct 传的是【昨日非一字板封板率】（不是总封板率）——与②保持同一口径。
+   * 注意：有些存档 / 回退路径下的 rate 对象可能没有 fbl（例如当日全是一字板时算不出来），
+   * 这时①会返回 null，调用方需自行兜底显示 --。 */
+  function metric(ratePct, aPct, bPct) {
+    // 对应 Excel 式 =C3/100*D3+1+E3/20
+    //   C 昨日非一字板封板率 → 百分数（47.92）
+    //   D 昨日涨停表现       → 小数（0.0248 即 2.48%）
+    //   E 上证%              → 百分数（0.48 即 +0.48%），不再除以 100
+    if (ratePct == null || !isFinite(ratePct)) return null;
+    if (aPct == null || !isFinite(aPct) || bPct == null || !isFinite(bPct)) return null;
+    return (ratePct / 100) * (aPct / 100) + 1 + bPct / 20;
+  }
+
+  // 指数②：C 非一字板封板率(%)、E 炸板率(%) 互补
+  //   = 100 × ( 883918% × 炸板率 + 883900% × 非一字板封板率 )
+  function metric2(cPct, aPct, fblPct) {
+    if (fblPct == null || !isFinite(fblPct)) return null;
+    if (cPct == null || aPct == null) return null;
+    var fbl = fblPct / 100, zbl = 1 - fbl;
+    return 100 * (cPct * zbl + aPct * fbl);
+  }
+
+  function shiftYmd(n, delta) {
+    var y = Math.floor(n / 10000), m = Math.floor(n / 100) % 100, d = n % 100;
+    var dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + delta);
+    return dt.getUTCFullYear() * 10000 + (dt.getUTCMonth() + 1) * 100 + dt.getUTCDate();
+  }
+
+  function bjNow() { return new Date(Date.now() + 8 * 3600 * 1000); }
+  function hmOf(d) { return pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()); }
+  function phaseText(d) {
+    var day = d.getUTCDay();
+    if (day === 0 || day === 6) return '周末休市';
+    var m = d.getUTCHours() * 60 + d.getUTCMinutes();
+    if (m < AUCTION_START) return '盘前';
+    if (m < AUCTION_END) return '集合竞价中';
+    if (m < OPEN_MIN) return '集合竞价已结束';
+    if (m <= 690) return '盘中 · 早盘';
+    if (m < 780) return '午间休市';
+    if (m <= CLOSE_MIN) return '盘中 · 午盘';
+    return '盘后';
+  }
+
+  /* ==================== JSONP ==================== */
+  function jsonp(url, cbName, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var script = document.createElement('script');
+      var done = false, t = null;
+      function cleanup() {
+        if (t) { clearTimeout(t); t = null; }
+        try { delete window[cbName]; } catch (e) { window[cbName] = undefined; }
+        if (script.parentNode) script.parentNode.removeChild(script);
+      }
+      window[cbName] = function (data) {
+        if (done) return;
+        done = true; cleanup(); resolve(data);
+      };
+      script.onerror = function () {
+        if (done) return;
+        done = true; cleanup(); reject(new Error('网络错误'));
+      };
+      t = setTimeout(function () {
+        if (done) return;
+        done = true; cleanup(); reject(new Error('超时'));
+      }, timeoutMs || 12000);
+      script.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
+      document.head.appendChild(script);
+    });
+  }
+
+  /* 分时接口是 JSONP（外面包了一层 callback）。以前用 <script> 标签加载，
+   * 但该接口带 `Cache-Control: max-age=60`，浏览器会拿本地缓存，
+   * 于是出现过「曲线停在某一分钟不再前进」的现象。
+   * 现在改成 fetch + `cache:'no-store'`，让浏览器每次都真去取；
+   * 万一 fetch 被跨域策略挡住（老浏览器 / 兼容模式），再退回 <script> 方式。
+   *
+   * 注意：不能给 fetch 加 `Cache-Control` / `Pragma` 请求头——
+   * 它们不在 CORS 安全名单里，会触发预检，而对方
+   * `Access-Control-Allow-Headers` 里没有这两个，反而会把请求搞挂。
+   */
+  async function fetchJsonp(url, cbName) {
+    var fresh = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
+    try {
+      var r = await fetch(fresh, { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      var txt = await r.text();
+      var i = txt.indexOf('('), j = txt.lastIndexOf(')');
+      if (i < 0 || j <= i) throw new Error('JSONP 格式异常');
+      return JSON.parse(txt.slice(i + 1, j));
+    } catch (e) {
+      return await jsonp(url, cbName);      // 兜底
+    }
+  }
+
+  /* ==================== 取数 ==================== */
+  async function getTimeSeries(cbKey, prefix, code, dateNum) {
+    var suffix = dateNum ? ('/' + dateNum) : '/last';
+    var cb = 'quotebridge_v6_time_' + prefix + '_' + code + (dateNum ? ('_' + dateNum) : '_last');
+    var url = BASE + '/v6/time/' + prefix + '_' + code + suffix + '.js';
+    var d = await fetchJsonp(url, cb);
+    var pack = d[prefix + '_' + code];
+    if (!pack || !pack.data) throw new Error('无分时数据 ' + code);
+    var pre = parseFloat(pack.pre);
+    var rows = [];
+    pack.data.split(';').forEach(function (r) {
+      var p = r.split(',');
+      if (p.length < 2 || !p[1]) return;
+      var price = parseFloat(p[1]);
+      if (!isFinite(price)) return;
+      rows.push({
+        t: fmtT(p[0]),
+        pct: pre > 0 ? (price / pre - 1) * 100 : null
+      });
+    });
+    return { date: pack.date, pre: pre, rows: rows };
+  }
+
+  function fmtDateNum(n) { var s = String(n); return s.slice(0, 4) + '-' + s.slice(4, 6) + '-' + s.slice(6, 8); }
+
+  /* ---- 实时快照 realhead：09:25 集合竞价撮合完成后就能拿到当天的开盘价 ----
+   * 为什么需要它：分时接口在 09:30 之前只会返回「上一交易日」的完整分时、却把 date
+   *   标成今天（张冠李戴，和分时接口是同一类行为），所以 09:25–09:30 这段拿不到今天的点。
+   *   realhead 快照没有这个问题，字段实测含义（三个标的都一致）：
+   *     6 = 昨收   7 = 今开   8 = 最高   9 = 最低   10 = 现价   199112 = 涨跌幅%
+   *   09:25 撮合完成后 `10` 就是今日开盘价 —— 实测 09:29 读到的 883900 现价 3856.333，
+   *   与 09:30 分时首点 3856.333 完全一致。
+   * 该接口同样带 Access-Control-Allow-Origin: *，浏览器可直连。
+   */
+  async function fetchRealhead(prefix, code) {
+    var url = BASE + '/v6/realhead/' + prefix + '_' + code + '/defer/last.js';
+    var cb = 'quotebridge_v6_realhead_' + prefix + '_' + code + '_defer_last';
+    var d = await fetchJsonp(url, cb);
+    var it = d && d.items;
+    if (!it) return null;
+    var price = parseFloat(it['10']);
+    var pre = parseFloat(it['6']);
+    if (!isFinite(price) || !isFinite(pre) || pre <= 0 || price <= 0) return null;
+    return { price: price, pre: pre, pct: (price / pre - 1) * 100 };
+  }
+
+  /* ---- 09:25 的开盘读数：把三个标的的实时快照拼成一个「今日首点」 ----
+   * 时刻记 09:25（真的就是这个点，不冒充 09:30），好让「最新记录点」和时间轴都不撒谎。 */
+  async function fetchOpeningRow() {
+    var a = await fetchRealhead('48', '883900');
+    await sleep(130);
+    var b = null;
+    try { b = await fetchRealhead('hs', '1A0001'); } catch (e) { b = null; }
+    await sleep(130);
+    var c = null;
+    try { c = await fetchRealhead('48', '883918'); } catch (e) { c = null; }
+    // ① 的两个输入缺一不可；883918 拿不到就把指数②置空（与盘中逻辑一致）
+    if (!a || !b) return null;
+    return { t: '09:25', pct: a.pct, bPct: b.pct, cPct: (c ? c.pct : null) };
+  }
+
+  /* ---- 「昨日封板率」基准 ----
+   * 首选：直连同花顺涨停池 / 炸板池自己算（实测该接口会把请求的 Origin 原样回显
+   *       到 Access-Control-Allow-Origin，所以浏览器可跨域直连，不依赖任何服务端任务）。
+   * 兜底：读仓库内的 data/*.json 存档（GitHub Actions 采集写入）。
+   * 基准是「日频」常量，按数据日期缓存，60 秒刷新不会重复请求。
+   */
+  var POOL_FIELDS = '199112,9001,330323,330324,330325,9002,330329,133971,133970,' +
+    '1968584,3475914,9003,9004,3475915,3475916,330326,330327,330328';
+  var rateCache = {};
+  // 归档缓存：日期字符串（2026-10-13）→ 归档 JSON（取不到记 null，避免反复 404）
+  var archCache = {};
+  // 归档日期列表（升序，来自 data/index.json），由 loadHistory 填。
+  // resolveRateArchive 靠它找「最近一个已归档的交易日」。
+  var archDates = [];
+
+  // 带超时的 fetch：某些网络环境下该域名会「挂住」而不是立刻报错，必须主动掐断，
+  // 否则会把整轮刷新拖死。取不到就走存档兜底。
+  async function fetchWithTimeout(url, ms) {
+    var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = null;
+    if (ctl) timer = setTimeout(function () { ctl.abort(); }, ms || 8000);
+    try {
+      return await fetch(url, ctl ? { signal: ctl.signal, cache: 'no-store' } : { cache: 'no-store' });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async function fetchPool(api, dateNum) {
+    var url = 'https://data.10jqka.com.cn/dataapi/limit_up/' + api +
+      '?page=1&limit=200&field=' + POOL_FIELDS +
+      '&filter=HS,GEM2STAR&order_field=330324&order_type=0&date=' + dateNum;
+    var r = await fetchWithTimeout(url, 8000);
+    if (!r.ok) throw new Error('涨停池 HTTP ' + r.status);
+    var j = await r.json();
+    return (j && j.data) ? j.data : null;
+  }
+
+  // 用同花顺池子的家数算出两种口径的封板率
+  function buildRate(dateNum, zt, zb) {
+    var A = (zt && zt.page) ? zt.page.total : 0;
+    if (!A) return null;
+    var Z = (zb && zb.page) ? zb.page.total : 0;
+    var oneWord = 0;
+    ((zt.info) || []).forEach(function (x) { if (x.limit_up_type === '一字板') oneWord++; });
+    var base = A - oneWord;                       // 非一字板涨停家数
+    var d0 = A + Z, d1 = base + Z;
+    return {
+      date: String(dateNum), zt: A, zb: Z, oneWord: oneWord, base: base,
+      rate: d0 > 0 ? +(A / d0 * 100).toFixed(4) : null,       // 总封板率（指数①）
+      fbl: d1 > 0 ? +(base / d1 * 100).toFixed(4) : null,     // 非一字板封板率（指数②）
+      zbl: d1 > 0 ? +(Z / d1 * 100).toFixed(4) : null,
+      src: 'live'
+    };
+  }
+
+  // dataDate = 当前这批分时所属的交易日；基准取它前面「最近一个有数据的交易日」
+  var liveRateFailUntil = 0;      // 直连不可用时退避，避免每轮刷新都白等超时
+  async function resolveRateLive(dataDate) {
+    if (Date.now() < liveRateFailUntil) return null;
+    var n = parseInt(dataDate, 10);
+    if (!isFinite(n)) return null;
+    try {
+      for (var back = 1; back <= 12; back++) {
+        var prev = shiftYmd(n, -back);
+        var zt = await fetchPool('limit_up_pool', prev);
+        if (!zt || !zt.page || !zt.page.total) continue;
+        var zb = null;
+        try { zb = await fetchPool('open_limit_pool', prev); } catch (e) { zb = null; }
+        var rr = buildRate(prev, zt, zb);
+        if (rr && rr.rate != null && rr.fbl != null) return rr;
+      }
+      return null;                                  // 接口通但无数据，不算故障
+    } catch (e) {
+      liveRateFailUntil = Date.now() + 10 * 60 * 1000;
+      return null;
+    }
+  }
+
+  // 归档文件的 10 分钟缓存（命中/未命中都缓存）—— 刷新间隔是 60 秒，
+  // 不缓存的话 5 日图每天都要重下 5 份 JSON；缓存太久又会看漏收盘后新落盘的归档。
+  var ARCH_TTL = 10 * 60 * 1000;
+  async function getArchive(ds) {
+    var c = archCache[ds];
+    if (c && (c.d || Date.now() - c.at < ARCH_TTL)) return c.d;
+    var d = null;
+    try {
+      var r = await fetch(DATA_BASE + ds + '.json?_=' + Date.now());
+      if (r.ok) d = await r.json();
+    } catch (e) { d = null; }
+    archCache[ds] = { at: Date.now(), d: d };
+    return d;
+  }
+
+  // 「某个已归档交易日 B 自己的家数」——B 收盘定格的那份封板率，
+  // 也就是「B 的下一个交易日」该用的基准。只有 collect.js 落盘时写的 self 有这份数据；
+  // 老归档没有 self，只能退回 B 的 rate（那是 B-1 的家数，会早一天）。
+  async function archiveOwnRate(bStr) {
+    var d = await getArchive(bStr);
+    if (d && d.self && d.self.rate != null) return d.self;
+    if (d && d.rate && d.rate.rate != null) return d.rate;
+    return null;
+  }
+
+  // dateNum = 要用基准的那一天（通常是当天）；基准 = 严格早于它的最近一个已归档交易日的「自家家数」。
+  // 只认 latest.json 是不够的：latest.json 的 rate 已经是「上一个已归档交易日的前一天」——
+  // 那样回退出来的「昨日非一字板封板率」会静悄悄地早一格。
+  async function resolveRateArchive(dateNum) {
+    var ds = fmtDateNum(String(dateNum || ''));
+
+    // 1) 当天自己已有归档（例如收盘后重开页面）：它存的 rate 就是「昨日」基准，直接可用
+    var own = await getArchive(ds);
+    if (own && own.rate && own.rate.rate != null) return own.rate;
+
+    // 2) 往前找最近一个已归档交易日 B（ISO 日期字符串天然可比），用它自己的家数
+    for (var i = archDates.length - 1; i >= 0; i--) {
+      if (archDates[i] >= ds) continue;
+      var r = await archiveOwnRate(archDates[i]);
+      if (r) return r;
+      break;
+    }
+
+    // 3) 最后兜底：latest.json（self 优先）
+    try {
+      var r2 = await fetch(DATA_BASE + 'latest.json?_=' + Date.now());
+      if (r2.ok) {
+        var d2 = await r2.json();
+        if (d2 && d2.self && d2.self.rate != null) return d2.self;
+        if (d2 && d2.rate && d2.rate.rate != null) return d2.rate;
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  async function resolveRate(dateNum) {
+    var key = String(dateNum || '');
+    if (key && rateCache[key]) return rateCache[key];
+    var live = await resolveRateLive(key);
+    if (live) { if (key) rateCache[key] = live; return live; }
+    var arch = await resolveRateArchive(key);
+    if (arch) { if (key) rateCache[key] = arch; return arch; }
+    return null;
+  }
+
+  /* ---- 当日封板率（贴在 ①② 数值后面，不参与那两个公式）----
+   * 与「封板率基准」唯一的不同：这里请求的 date 就是「当天」。
+   * 同花顺的池子在盘中会实时累加当日的涨停 / 炸板家数，收盘后定格为当日终值。
+   *
+   * 关键行为：当天还没有数据时（过零点 / 盘前 / 非交易日），
+   * 往前回退到「最近一个有数据的交易日」，把上一次收盘的封板率一直留到次日开盘。
+   * 否则每天一过零点就会变成「--」，既没意义又把版面弄花。
+   */
+  var todayRateCache = { at: 0, val: null, fallback: false };
+
+  function ymdOfBJ(d) {
+    return d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate();
+  }
+  // Unix 秒 → 北京时间归属日（服务器时间戳统一按北京时间归日）
+  function tsToYmd(sec) {
+    var n = parseInt(sec, 10);
+    if (!isFinite(n)) return null;
+    return ymdOfBJ(new Date((n + 8 * 3600) * 1000));
+  }
+
+  // 取「某一天」的封板率；该日无数据（total = 0）时返回 null
+  async function fetchRateOn(dateNum) {
+    var zt = await fetchPool('limit_up_pool', dateNum);
+    await sleep(140);
+    var zb = null;
+    try { zb = await fetchPool('open_limit_pool', dateNum); } catch (e) { zb = null; }
+
+    var A = (zt && zt.page) ? zt.page.total : 0;
+    if (!A) return null;
+
+    // 防「张冠李戴」：池子里最新的首封时间必须落在该日，否则不认。
+    // （同花顺在盘前会把上一交易日的数据挂到今天的日期上，和分时接口是同一类行为）
+    var info = zt.info || [], newest = 0;
+    for (var i = 0; i < info.length; i++) {
+      var t0 = parseInt(info[i].first_limit_up_time, 10);
+      if (isFinite(t0) && t0 > newest) newest = t0;
+    }
+    if (newest && tsToYmd(newest) !== dateNum) return null;
+
+    var Z = (zb && zb.page) ? zb.page.total : 0;
+    var oneWord = 0;
+    for (var j = 0; j < info.length; j++) { if (info[j].limit_up_type === '一字板') oneWord++; }
+    var base = A - oneWord, d0 = A + Z, d1 = base + Z;
+    return {
+      date: dateNum, zt: A, zb: Z, oneWord: oneWord, base: base,
+      rate: d0 > 0 ? +(A / d0 * 100).toFixed(4) : null,          // 总封板率（①口径）
+      fbl: d1 > 0 ? +(base / d1 * 100).toFixed(4) : null         // 非一字板封板率（②口径）
+    };
+  }
+
+  async function fetchTodayRate() {
+    // 注意：ymdOfBJ 返回的是「数字」日期（20261013），不是 Date —— 要拿时分/星期得用 bjNow()
+    var nowBJ = bjNow();
+    var today = ymdOfBJ(nowBJ);
+    // 当日实时数据 55 秒过期（刷新间隔 60 秒）；
+    // 回退数据 5 分钟过期——盘前 / 非交易日它本来就不会变，没必要每分钟重问一遍。
+    // 例外：09:00–09:35 这段把回退缓存压到 20 秒。因为当天第一笔数据正好落在
+    // 09:25（集合竞价撮合），若沿用 5 分钟缓存，页面可能拖到 09:29 才翻成今天。
+    var mins = nowBJ.getUTCHours() * 60 + nowBJ.getUTCMinutes();
+    var dW = nowBJ.getUTCDay();
+    var nearOpen = (dW >= 1 && dW <= 5) && mins >= 9 * 60 && mins <= 9 * 60 + 35;
+    var ttl = todayRateCache.fallback ? (nearOpen ? 20000 : 5 * 60 * 1000) : 55000;
+    if (todayRateCache.val && Date.now() - todayRateCache.at < ttl) return todayRateCache.val;
+
+    var r = await fetchRateOn(today);
+    var fb = false;
+    if (!r) {
+      // 当天还没有数据 → 往前找最近一个有数据的交易日（跨周末最多 3 步，10 步是保险上限）
+      for (var back = 1; back <= 10; back++) {
+        var rr = await fetchRateOn(shiftYmd(today, -back));
+        if (rr) { r = rr; fb = true; break; }
+      }
+    }
+    todayRateCache = { at: Date.now(), val: r, fallback: fb };
+    return r;
+  }
+
+  // 封板率高 = 情绪强（红）／低 = 情绪弱（绿）。三档：≥60 / 40~60 / ≤40
+  function clsRate(p) { return p == null ? 'flat' : (p >= 60 ? 'up' : (p <= 40 ? 'down' : 'flat')); }
+  function pctOf(v) { return (v == null || !isFinite(v)) ? '--' : v.toFixed(2) + '%'; }
+
+  /* 把「今日实时非一字板封板率」贴在 ①② 两个数值后面。
+   * 全部统一到【非一字板】口径 —— 与 ①② 两个公式的权重口径一致，也和①/②的昨日基准一致。
+   * （今日总封板率不再出现在这里，只在顶部 meta 行留作参考。）
+   *
+   * ⚠ 唯一要留意的：贴的这两个数是「今天」的，而 ①② 公式用的是「昨天」的基准
+   *   （顶部 meta 行那两行）。两组数常在同一量级、看着像同一个东西，
+   *   所以给鼠标悬停补一份完整算式（title 属性，不占任何可见空间）并列出昨日基准做对照。
+   */
+  function rateTip(which, today, base) {
+    var L = ['今日实时 · 非一字板封板率（' + which + ' 后面这个数）'];
+    if (today && today.fbl != null) {
+      L.push('= 非一字板 ' + today.base + ' 家 ÷ (非一字板 ' + today.base + ' + 炸板 ' + today.zb + ' 家)');
+      L.push('= ' + today.base + '/' + (today.base + today.zb) + ' = ' + today.fbl.toFixed(2) + '%');
+      L.push('（非一字板 = 涨停 ' + today.zt + ' − 一字板 ' + today.oneWord + '）');
+    } else if (today) {
+      L.push('当日全是一字板（非一字板 0 家），分母为 0，无法计算');
+    } else {
+      L.push('暂未取到今日数据');
+    }
+    L.push('数据源：同花顺涨停池 / 炸板池（filter=HS,GEM2STAR）');
+    if (base && base.fbl != null) {
+      L.push('—— 对照：①② 两个公式用的都是「昨日」' + base.date + ' 的非一字板封板率 ' + base.fbl.toFixed(2) + '%');
+    }
+    L.push('（盘中实时累加，收盘定格为当日终值）');
+    return L.join('\n');
+  }
+
+  function renderTodayRate(t) {
+    var base = state.rate;
+    // ①② 后面挂的都是今日非一字板封板率（同一口径、同一个数）
+    var items = [
+      ['curRate', t ? t.fbl : null, rateTip('①', t, base)],
+      ['curRate2', t ? t.fbl : null, rateTip('②', t, base)]
+    ];
+    for (var i = 0; i < items.length; i++) {
+      var e = document.getElementById(items[i][0]);
+      if (!e) continue;
+      var v = items[i][1];
+      e.textContent = (v == null) ? '--' : ('封板率 ' + v.toFixed(2) + '%');
+      e.className = 'r ' + clsRate(v);
+      e.title = items[i][2];
+    }
+  }
+
+  async function loadHistory() {
+    var res = await fetch(DATA_BASE + 'index.json?_=' + Date.now());
+    if (!res.ok) throw new Error('index.json 读取失败');
+    var idx = await res.json();
+    // 全量日期交给 resolveRateArchive 用（它要顺着往前找「最近一个已归档交易日」）
+    archDates = (idx.dates || []).slice();
+    var dates = archDates.slice(-DAYS_5D);
+    var out = [];
+    for (var i = 0; i < dates.length; i++) {
+      // 走 getArchive 复用缓存，免得 5 日图每分钟把这几份 JSON 重下一遍
+      var dd = await getArchive(dates[i]);
+      // 过滤掉尚无分钟点的空文件（例如刚开盘、当天还没采到数据）
+      if (dd && dd.points && dd.points.length) out.push(dd);
+    }
+    return out;
+  }
+
+  /* ==================== 图表公共部件 ==================== */
+  function getChart(id) {
+    if (!charts[id]) {
+      var dom = document.getElementById(id);
+      if (!dom) return null;
+      charts[id] = echarts.init(dom);
+      window.addEventListener('resize', function () { charts[id].resize(); });
+    }
+    return charts[id];
+  }
+
+  function baseYAxis(min, max, step, digits) {
+    return {
+      type: 'value',
+      min: min,
+      max: max,
+      interval: step,
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: {
+        color: '#9aa1ab', fontSize: isNarrow() ? 10 : 11,
+        formatter: function (v) { return digits ? Number(v).toFixed(digits) : String(Number(v)); }
+      },
+      splitLine: { lineStyle: { color: '#f1f2f4' } }
+    };
+  }
+
+  // 1 日图横轴：固定为完整交易日的 242 个分钟刻度
+  function baseXAxisDay() {
+    return {
+      type: 'category',
+      data: DAY_TICKS,
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: '#dfe2e7' } },
+      axisTick: { show: false },
+      axisLabel: {
+        color: '#9aa1ab', fontSize: 10,
+        // 固定刻度下只保留整/半小时，避免 242 个标签互相压叠
+        interval: function (i, v) { return !!DAY_LABELS[v]; }
+      }
+    };
+  }
+
+  // 5 日图专用横轴：刻度 = 5 天连续铺开的 'MMDD|HH:MM'
+  function baseXAxis5d(ticks) {
+    return {
+      type: 'category',
+      data: ticks,
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: '#dfe2e7' } },
+      axisTick: { show: false },
+      axisLabel: {
+        color: '#9aa1ab', fontSize: 10,
+        // 用 interval 过滤：5×242 个刻度里只留每天 4 个（开盘日 + 10:30/13:30/15:00）
+        interval: function (i, v) { return !!label5dOf(v); },
+        formatter: function (v) {
+          var o = label5dOf(v);
+          if (!o) return '';
+          // 日期加粗突出，便于一眼分辨「这一段是哪个交易日」
+          return o.date ? '{d|' + o.text + '}' : o.text;
+        },
+        rich: { d: { color: '#4b5563', fontSize: 10, fontWeight: 'bold' } }
+      }
+    };
+  }
+
+  // 多条横线：中性基准（灰）+ 下阈（红）+ 上阈（绿）
+  function badgeLines(items) {
+    return {
+      silent: true, symbol: 'none',
+      data: items.map(function (it) {
+        return {
+          yAxis: it.y,
+          lineStyle: {
+            color: it.color, type: 'dashed',
+            width: it.width || 1, opacity: it.opacity == null ? .6 : it.opacity
+          },
+          label: {
+            // 靠右放置：左端会被 y 轴刻度标签压住
+            show: true, position: 'insideEndTop',
+            formatter: it.label, color: it.color, fontSize: 10
+          }
+        };
+      })
+    };
+  }
+
+  // 背景警示带：下阈以下淡红、上阈以上淡绿（silent，不挡 tooltip）
+  function dangerZones(yMin, yMax, lo, hi) {
+    var d = [];
+    if (lo > yMin) {
+      d.push([
+        { yAxis: yMin, itemStyle: { color: 'rgba(217,48,37,.075)' } },
+        { yAxis: lo }
+      ]);
+    }
+    if (hi < yMax) {
+      d.push([
+        { yAxis: hi, itemStyle: { color: 'rgba(15,157,88,.075)' } },
+        { yAxis: yMax }
+      ]);
+    }
+    return { silent: true, data: d };
+  }
+
+  // 按 y 值分段着色（< 下阈 红 / 区间内 本色 / > 上阈 绿）
+  function zoneVisualMap(dim, lo, hi, midColor, seriesIndex) {
+    return {
+      type: 'piecewise',
+      show: false,
+      dimension: dim,
+      seriesIndex: seriesIndex == null ? 0 : seriesIndex,
+      pieces: [
+        { lt: lo, color: C_RED },
+        { gte: lo, lte: hi, color: midColor },
+        { gt: hi, color: C_GREEN }
+      ]
+    };
+  }
+
+  function areaFill(rgb) {
+    return {
+      color: {
+        type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+        colorStops: [
+          { offset: 0, color: 'rgba(' + rgb + ',.20)' },
+          { offset: 1, color: 'rgba(' + rgb + ',.01)' }
+        ]
+      }
+    };
+  }
+
+  /* ==================== 指数① 涨停情绪指数 ==================== */
+  function drawToday(rows, ratePct, notices) {
+    var c = getChart('chartMain');
+    if (!c) return;
+    var lg = document.getElementById('legendMain');
+    if (lg) lg.innerHTML = '';
+
+    if (ratePct == null) {
+      // 基准（昨日非一字板封板率）还没取到就不画，避免画出一条无意义的线
+      c.clear();
+      notices.push('基准未取到');
+      return;
+    }
+
+    var pts = [];
+    rows.forEach(function (p) {
+      if (p.pct == null || !DAY_TICK_SET[p.t]) return;
+      var v = metric(ratePct, p.pct, p.bPct);
+      // 注意：不能用 !isFinite(v) 判断 —— isFinite(null) 是 true，会把 null 放过去再 .toFixed 崩掉
+      if (v == null || !isFinite(v)) return;
+      pts.push({ t: p.t, v: v, pct: p.pct, bPct: p.bPct });
+    });
+    // 用 [时刻, 值] 配对：横轴固定为完整一天，数据只铺到当前时刻，右半段自然留白
+    var data = pts.map(function (x) { return [x.t, +x.v.toFixed(5)]; });
+    // 09:25–09:30 只有「开盘读数」这一个点，连线画不出来 → 至少把点标出来，别让图看着是空的
+    var few = pts.length < 2;
+    c.setOption({
+      animation: false,
+      grid: chartGrid(),
+      tooltip: {
+        trigger: 'axis',
+        confine: true,          // 手机上提示框必须限制在图表内，否则会溢出屏幕
+        backgroundColor: 'rgba(255,255,255,.97)',
+        borderColor: '#e8eaed',
+        textStyle: { color: '#1f2329', fontSize: 12 },
+        formatter: function (ps) {
+          if (!ps || !ps.length) return '';
+          var it = ps[0];
+          var p = pts[it.dataIndex];
+          if (!p) return '';
+          return it.axisValue + '　<b>' + p.v.toFixed(4) + '</b>';
+        }
+      },
+      xAxis: baseXAxisDay(),
+      yAxis: baseYAxis(Y_MIN, Y_MAX, Y_STEP, 3),
+      visualMap: zoneVisualMap(1, TH1_LO, TH1_HI, '#2f6bd8'),
+      series: [{
+        type: 'line', data: data,
+        symbol: few ? 'circle' : 'none', symbolSize: few ? 6 : 0, showSymbol: few,
+        smooth: false,
+        // 注意：这里不能写死 lineStyle.color，否则会盖掉 visualMap 的分段染色
+        lineStyle: { width: 1.7 },
+        areaStyle: areaFill('47,107,216'),
+        markArea: dangerZones(Y_MIN, Y_MAX, TH1_LO, TH1_HI),
+        markLine: badgeLines([
+          { y: Y_BASE, label: '1.000', color: C_BASE },
+          { y: TH1_LO, label: TH1_LO.toFixed(3), color: C_RED },
+          { y: TH1_HI, label: TH1_HI.toFixed(3), color: C_GREEN }
+        ])
+      }]
+    }, true);
+
+    if (!pts.length) notices.push('暂无分时数据');
+    var over = countOut(pts.map(function (x) { return x.v; }), Y_MIN, Y_MAX);
+    if (over) {
+      notices.push('⚠ ' + over + ' 点越界');
+    }
+  }
+
+  /* 5 日视图：横轴 = 最近 5 个交易日「按顺序连续铺开」。
+   *   每天占 DAY_TICKS.length 个刻度，整条曲线自左向右依次是 D-4 → D。
+   *   每天仍是独立颜色的一段线（各自取所属交易日的基准），相邻两天之间用竖向虚线分隔。 */
+  function draw5d(days, notices) {
+    var c = getChart('chartMain');
+    if (!c) return;
+    var lg = document.getElementById('legendMain');
+    if (lg) lg.innerHTML = '';
+
+    var ax = build5dTicks(days);
+    var series = [], allV = [], used = [];
+
+    days.forEach(function (day, i) {
+      var color = COLORS[i % COLORS.length];
+      var mmdd = mmddOf(day.date);
+      // 与①的公式一致：取当日的前一交易日的【非一字板封板率】作基准（总封板率不再参与计算）
+      var base = (day.rate && day.rate.fbl != null) ? day.rate.fbl : null;
+      var baseDate = (day.rate && day.rate.date) ? String(day.rate.date) : '';
+      var pts = [];
+      (day.points || []).forEach(function (p) {
+        if (base == null || p.a == null || !DAY_TICK_SET[p.t]) return;
+        var v = metric(base, p.a, p.b);
+        if (v == null || !isFinite(v)) return;   // isFinite(null) 为 true，必须显式判 null
+        allV.push(v);
+        pts.push([mmdd + '|' + p.t, +v.toFixed(5)]);
+      });
+      used.push({ date: day.date, mmdd: mmdd, base: base, baseDate: baseDate, color: color });
+      if (!pts.length) return;                 // 该日无可用点就不建系列
+      // 初期某天可能只有 1-2 个点：此时连线画不出来，至少把点标出来，避免「图例有、图上没有」
+      var few = pts.length < 2;
+      var s = {
+        name: dashMMDD(mmdd),
+        type: 'line',
+        data: pts,
+        symbol: few ? 'circle' : 'none',
+        symbolSize: few ? 6 : 0,
+        showSymbol: few,
+        smooth: false,
+        lineStyle: { width: 1.5, color: color },
+        itemStyle: { color: color }
+      };
+      // 5 日图靠颜色区分「哪一天」，所以不按阈值改线色，
+      // 只用背景警示带 + 阈值虚线表达「跌破 / 涨破」；
+      // 竖向的「日分隔线」并进同一条 markLine，避免在多条线上重复渲染。
+      if (!series.length) {
+        s.markArea = dangerZones(Y_MIN, Y_MAX, TH1_LO, TH1_HI);
+        var ml = badgeLines([
+          { y: Y_BASE, label: '1.000', color: C_BASE },
+          { y: TH1_LO, label: TH1_LO.toFixed(3), color: C_RED },
+          { y: TH1_HI, label: TH1_HI.toFixed(3), color: C_GREEN }
+        ]);
+        ml.data = ml.data.concat(daySepLines5d(ax.ticks, ax.start));
+        s.markLine = ml;
+      }
+      series.push(s);
+    });
+
+    if (!series.length) {
+      c.clear();
+      notices.push('历史数据积累中');
+      return;
+    }
+
+    c.setOption({
+      animation: false,
+      grid: chartGrid(),
+      tooltip: {
+        trigger: 'axis',
+        confine: true,          // 手机上提示框必须限制在图表内，否则会溢出屏幕
+        backgroundColor: 'rgba(255,255,255,.97)',
+        borderColor: '#e8eaed',
+        textStyle: { color: '#1f2329', fontSize: 12 },
+        formatter: function (ps) {
+          if (!ps || !ps.length) return '';
+          var out = ['<b>' + fmtKey5d(ps[0].axisValue) + '</b>'];
+          ps.forEach(function (it) {
+            if (it.data == null) return;
+            var v = Number(it.data[1]);
+            if (!isFinite(v)) return;
+            out.push(it.marker + it.seriesName + ' <b>' + v.toFixed(4) + '</b>');
+          });
+          return out.length > 1 ? out.join('<br/>') : '';
+        }
+      },
+      xAxis: baseXAxis5d(ax.ticks),
+      yAxis: baseYAxis(Y_MIN, Y_MAX, Y_STEP, 3),
+      series: series
+    }, true);
+
+    if (lg) {
+      // 手机版只留「颜色 → 哪一天」的对应，不再挂百分比：
+      // 那个数是「这一天算公式时用的基准（= 前一交易日）」，写在图例里极易被读成
+      // 「这一天的封板率」。横轴本身每个交易日都带日期前缀，图例只做用色索引即可。
+      lg.innerHTML = used.map(function (u) {
+        return '<span><i style="background:' + u.color + '"></i>' + dashMMDD(mmddOf(u.date)) + '</span>';
+      }).join('');
+    }
+
+    if (used.length < 2) {
+      notices.push('历史数据积累中 · ' + used.length + ' 天');
+    }
+
+    var over5 = countOut(allV, Y_MIN, Y_MAX);
+    if (over5) {
+      notices.push('⚠ ' + over5 + ' 点越界');
+    }
+  }
+
+  /* ==================== 指数② 打板收益 ==================== */
+  function drawToday2(rows, fblPct, notices) {
+    var c = getChart('chart2');
+    if (!c) return;
+    var lg = document.getElementById('legend2');
+    if (lg) lg.innerHTML = '';
+
+    if (fblPct == null) {
+      c.clear();
+      notices.push('基准未取到');
+      return;
+    }
+
+    var pts = [];
+    rows.forEach(function (p) {
+      if (p.pct == null || p.cPct == null || !DAY_TICK_SET[p.t]) return;
+      var v = metric2(p.cPct, p.pct, fblPct);
+      if (v == null) return;
+      pts.push({ t: p.t, v: v, pct: p.pct, cPct: p.cPct });
+    });
+    var data = pts.map(function (x) { return [x.t, +x.v.toFixed(2)]; });
+    var few2 = pts.length < 2;      // 同上：开盘点只有一个时也要看得见
+
+    c.setOption({
+      animation: false,
+      grid: chartGrid(),
+      tooltip: {
+        trigger: 'axis',
+        confine: true,          // 手机上提示框必须限制在图表内，否则会溢出屏幕
+        backgroundColor: 'rgba(255,255,255,.97)',
+        borderColor: '#e8eaed',
+        textStyle: { color: '#1f2329', fontSize: 12 },
+        formatter: function (ps) {
+          if (!ps || !ps.length) return '';
+          var it = ps[0];
+          var p = pts[it.dataIndex];
+          if (!p) return '';
+          return it.axisValue + '　<b>' + p.v.toFixed(2) + '</b>';
+        }
+      },
+      xAxis: baseXAxisDay(),
+      yAxis: baseYAxis(Y2_MIN, Y2_MAX, Y2_STEP, 0),
+      visualMap: zoneVisualMap(1, TH2_LO, TH2_HI, '#e08a1e'),
+      series: [{
+        type: 'line', data: data,
+        symbol: few2 ? 'circle' : 'none', symbolSize: few2 ? 6 : 0, showSymbol: few2,
+        smooth: false,
+        // 同上：颜色交给 visualMap 分段决定
+        lineStyle: { width: 1.7 },
+        areaStyle: areaFill('224,138,30'),
+        markArea: dangerZones(Y2_MIN, Y2_MAX, TH2_LO, TH2_HI),
+        markLine: badgeLines([
+          { y: Y2_BASE, label: '0', color: C_BASE },
+          { y: TH2_LO, label: String(TH2_LO), color: C_RED },
+          { y: TH2_HI, label: String(TH2_HI), color: C_GREEN }
+        ])
+      }]
+    }, true);
+
+    if (!pts.length) notices.push('暂无分时数据');
+    var over = countOut(pts.map(function (x) { return x.v; }), Y2_MIN, Y2_MAX);
+    if (over) {
+      notices.push('⚠ ' + over + ' 点越界');
+    }
+  }
+
+  /* 指数②的 5 日视图：横轴口径与 draw5d 完全一致（5 天按顺序连续铺开、日间竖虚线分隔） */
+  function draw5d2(days, notices) {
+    var c = getChart('chart2');
+    if (!c) return;
+    var lg = document.getElementById('legend2');
+    if (lg) lg.innerHTML = '';
+
+    var ax = build5dTicks(days);
+    var series = [], allV = [], used = [];
+
+    days.forEach(function (day, i) {
+      var fbl = day.rate && day.rate.fbl;
+      if (fbl == null || !isFinite(fbl)) return;             // 该日缺「非一字板封板率」基准
+      var color = COLORS[i % COLORS.length];
+      var mmdd = mmddOf(day.date);
+      var pts = [];
+      (day.points || []).forEach(function (p) {
+        if (p.c == null || !DAY_TICK_SET[p.t]) return;        // 缺 883918 的点跳过
+        var v = metric2(p.c, p.a, fbl);
+        if (v == null) return;
+        allV.push(v);
+        pts.push([mmdd + '|' + p.t, +v.toFixed(2)]);
+      });
+      if (!pts.length) return;                                // 完全没有可用点就不画（避免空图例）
+      used.push({ date: day.date, fbl: fbl, color: color });
+      var few = pts.length < 2;
+      var s2 = {
+        name: dashMMDD(mmdd), type: 'line', data: pts,
+        symbol: few ? 'circle' : 'none', symbolSize: few ? 6 : 0, showSymbol: few,
+        smooth: false, lineStyle: { width: 1.5, color: color }, itemStyle: { color: color }
+      };
+      if (!series.length) {
+        s2.markArea = dangerZones(Y2_MIN, Y2_MAX, TH2_LO, TH2_HI);
+        var ml2 = badgeLines([
+          { y: Y2_BASE, label: '0', color: C_BASE },
+          { y: TH2_LO, label: String(TH2_LO), color: C_RED },
+          { y: TH2_HI, label: String(TH2_HI), color: C_GREEN }
+        ]);
+        ml2.data = ml2.data.concat(daySepLines5d(ax.ticks, ax.start));
+        s2.markLine = ml2;
+      }
+      series.push(s2);
+    });
+
+    if (!series.length) {
+      c.clear();
+      notices.push('历史数据积累中');
+      return;
+    }
+
+    c.setOption({
+      animation: false,
+      grid: chartGrid(),
+      tooltip: {
+        trigger: 'axis',
+        confine: true,          // 手机上提示框必须限制在图表内，否则会溢出屏幕
+        backgroundColor: 'rgba(255,255,255,.97)',
+        borderColor: '#e8eaed',
+        textStyle: { color: '#1f2329', fontSize: 12 },
+        formatter: function (ps) {
+          if (!ps || !ps.length) return '';
+          var out = ['<b>' + fmtKey5d(ps[0].axisValue) + '</b>'];
+          ps.forEach(function (it) {
+            if (it.data == null) return;
+            var v = Number(it.data[1]);
+            if (!isFinite(v)) return;
+            out.push(it.marker + it.seriesName + ' <b>' + v.toFixed(2) + '</b>');
+          });
+          return out.length > 1 ? out.join('<br/>') : '';
+        }
+      },
+      xAxis: baseXAxis5d(ax.ticks),
+      yAxis: baseYAxis(Y2_MIN, Y2_MAX, Y2_STEP, 0),
+      series: series
+    }, true);
+
+    if (lg) {
+      lg.innerHTML = used.map(function (u) {
+        return '<span><i style="background:' + u.color + '"></i>' + dashMMDD(mmddOf(u.date)) + '</span>';
+      }).join('');
+    }
+
+    if (used.length < 2) {
+      notices.push('历史数据积累中 · ' + used.length + ' 天');
+    }
+    var over = countOut(allV, Y2_MIN, Y2_MAX);
+    if (over) {
+      notices.push('⚠ ' + over + ' 点越界');
+    }
+  }
+
+  /* ==================== 视图切换（1日 / 5日，两张图共用） ==================== */
+  var VIEW = (function () {
+    // 支持 ?view=5d 深链接直达
+    try {
+      var m = String(location.search).match(/[?&]view=(1d|5d)\b/);
+      return m ? m[1] : '1d';
+    } catch (e) { return '1d'; }
+  })();
+  var state = { rows: [], rate: null, days: [] };
+
+  var HINT_1D = '实时计算，每分钟刷新；横轴固定为完整交易日 09:25–15:00（09:25 为集合竞价撮合点）';
+  var HINT_5D = '最近 5 个交易日按顺序连续铺开：横轴跨 5 天，日内仍是分钟粒度；'
+    + '每天取「所属交易日的前一交易日」非一字板封板率作基准，日与日之间以竖虚线分隔';
+
+  function renderAll() {
+    var n1 = [], n2 = [];
+    var isDay = (VIEW === '1d');
+    if (isDay) {
+      // ①② 统一用「昨日非一字板封板率」作权重
+      drawToday(state.rows, state.rate ? state.rate.fbl : null, n1);
+      drawToday2(state.rows, state.rate ? state.rate.fbl : null, n2);
+    } else {
+      // chartDays = 仓库存档 + 当天直连（见 refresh）；缺失时退回存档
+      var ds = (state.chartDays && state.chartDays.length) ? state.chartDays : state.days;
+      draw5d(ds, n1);
+      draw5d2(ds, n2);
+    }
+    var e1 = document.getElementById('hintMain');
+    if (e1) e1.innerHTML = n1.filter(Boolean).join('<br/>');
+    var e2 = document.getElementById('hint2');
+    if (e2) e2.innerHTML = n2.filter(Boolean).join('<br/>');
+  }
+
+  function bindTabs() {
+    var box = document.getElementById('viewTabs');
+    if (!box) return;
+    // 初始态与 VIEW 对齐（含 ?view=5d 直达）
+    Array.prototype.forEach.call(box.querySelectorAll('button'), function (x) {
+      x.className = (x.getAttribute('data-v') === VIEW) ? 'on' : '';
+    });
+    var hint0 = document.getElementById('viewHint');
+    if (hint0 && VIEW === '5d') {
+      hint0.textContent = HINT_5D;
+    }
+    box.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-v]') : null;
+      if (!b) return;
+      var v = b.getAttribute('data-v');
+      if (v === VIEW) return;
+      VIEW = v;
+      Array.prototype.forEach.call(box.querySelectorAll('button'), function (x) {
+        x.className = (x === b) ? 'on' : '';
+      });
+      var hint = document.getElementById('viewHint');
+      if (hint) {
+        hint.textContent = (v === '1d') ? HINT_1D : HINT_5D;
+      }
+      renderAll();
+    });
+  }
+
+  /* ==================== 主流程 ==================== */
+  // 是否在交易日里、且已经过了某个时刻（now 是 bjNow() 的产物，读 UTC 字段即北京时间）
+  function isWeekday(d) { var w = d.getUTCDay(); return w >= 1 && w <= 5; }
+  function minsOf(d) { return d.getUTCHours() * 60 + d.getUTCMinutes(); }
+
+  // 连续竞价时段：09:30 – 15:00
+  function inSession(now) {
+    if (!isWeekday(now)) return false;
+    var m = minsOf(now);
+    return m >= OPEN_MIN && m <= CLOSE_MIN;
+  }
+
+  // 今日行情是否已开始：09:25 集合竞价撮合完成（开盘价已定）即算开始。
+  // 这是本次改动的主开关——用户要求页面在 09:25 而不是 09:30 翻到新交易日。
+  function todayStarted(now) {
+    if (!isWeekday(now)) return false;
+    var m = minsOf(now);
+    return m >= AUCTION_END && m <= CLOSE_MIN;
+  }
+
+  async function refresh() {
+    if (busy) return;
+    busy = true;
+    var dot = document.getElementById('liveDot');
+    if (dot) dot.className = 'dot';
+    setText('liveText', '…');
+    var errBox = document.getElementById('errBox');
+    if (errBox) errBox.textContent = '';
+
+    try {
+      var now = bjNow();
+
+      // 0) 历史（5 日图 & 非交易时段的当日图都依赖它）
+      var days = [];
+      try { days = await loadHistory(); } catch (e) { days = []; }
+      state.days = days;
+
+      var rows = [], rate = null, dataDate = null, archived = false;
+
+      // ---- 直连同花顺分时（盘中 / 盘后都用它）----
+      // 关键点：盘后该接口返回的是当日「完整」分时，末点即收盘值，所以收盘后也能直接算出收盘结果，
+      // 不再依赖仓库里的当日存档（存档可能因 GitHub 定时任务未触发而缺半天，之前就是这样显示错的）。
+      try {
+        var aPack = await getTimeSeries('a', '48', '883900');
+        await sleep(160);
+        var bPack = await getTimeSeries('b', 'hs', '1A0001');
+        await sleep(160);
+        var cPack = null;
+        try { cPack = await getTimeSeries('c', '48', '883918'); } catch (e) { cPack = null; }
+
+        var bMap = {};
+        bPack.rows.forEach(function (x) { bMap[x.t] = x.pct; });
+        var cMap = {};
+        if (cPack) cPack.rows.forEach(function (x) { cMap[x.t] = x.pct; });
+
+        aPack.rows.forEach(function (x) {
+          var b = bMap[x.t];
+          if (x.pct == null || b == null) return;
+          // 883918 取不到时只置空 cPct（指数②跳过该点），不影响指数①
+          rows.push({ t: x.t, pct: x.pct, bPct: b, cPct: (cMap[x.t] == null ? null : cMap[x.t]) });
+        });
+        dataDate = aPack.date ? String(aPack.date) : null;
+
+        // 同花顺的已知行为：开盘前调用分时接口，会把「上一交易日的完整分时」
+        // 原样返回、却把 date 标成今天。若不识别，页面会在盘前把昨天的曲线
+        // 当成今天画出（顶部日期还显示今天），属于张冠李戴。
+        // 判据：分时末点的时刻晚于「现在」→ 不可能是当日数据 → 丢弃，改走存档兜底。
+        //   盘前 09:26 末点 15:00 → 丢弃 ✔ ；盘中 10:00 末点 10:00 → 保留 ✔ ；
+        //   午休 11:35 末点 11:30 → 保留 ✔ ；盘后 15:30 末点 15:00 → 保留 ✔
+        var endTick = rows.length ? rows[rows.length - 1].t : null;
+        if (endTick) {
+          var em = parseInt(endTick.slice(0, 2), 10) * 60 + parseInt(endTick.slice(3, 5), 10);
+          var nm = now.getUTCHours() * 60 + now.getUTCMinutes();
+          if (isFinite(em) && em > nm + 2) { rows = []; }
+        }
+      } catch (e) {
+        rows = [];
+      }
+
+      // ---- 今日封板率 ----
+      // 顺手把它提到前面来：09:25–09:30 这段要靠「今日池子有没有家数」来判断
+      // 今天到底开没开盘（非交易日/节假日查当日池子恒为 0 家），
+      // 免得给休市日凭空造出一个开盘点。
+      var todayLive = null;
+      try { todayLive = await fetchTodayRate(); } catch (e) { todayLive = null; }
+      var todayIsLive = !!(todayRateCache.val && !todayRateCache.fallback);
+
+      // ---- 09:25–09:30 的空档：分时接口此时还只有「昨天」的数据（已被上面的判据丢弃），
+      //      改用 realhead 快照补一个今日开盘点。这就是用户要的「9:25 就更新页面」。 ----
+      // 严格限定在开盘前：09:30 之后 realhead 的现价已经会变，再标成 09:25 就是假时间了；
+      // 那时的接口偶发失败仍按老规矩退回存档兜底。
+      var usedOpening = false;
+      // 今日已开始（09:25 撮合完成）但还没到 09:30 → 分时此刻必然只有昨天那份
+      var inOpenGap = todayStarted(now) && minsOf(now) < OPEN_MIN;
+      if (!rows.length && todayIsLive && inOpenGap) {
+        try {
+          var oRow = await fetchOpeningRow();
+          if (oRow) {
+            rows = [oRow];
+            dataDate = String(ymdOfBJ(now));
+            usedOpening = true;
+          }
+        } catch (e) { /* 拿不到就继续往下走存档兜底 */ }
+      }
+
+      if (rows.length) rate = await resolveRate(dataDate);
+
+      // ---- 兜底：直连失败时退回仓库里最近一个交易日的存档 ----
+      if (!rows.length) {
+        var lastDay = days.length ? days[days.length - 1] : null;
+        if (lastDay) {
+          rate = lastDay.rate;
+          dataDate = String(lastDay.date || '').replace(/-/g, '');
+          rows = (lastDay.points || []).map(function (p) {
+            return { t: p.t, pct: p.a, bPct: p.b, cPct: (p.c == null ? null : p.c) };
+          });
+          archived = true;
+        }
+      }
+      if (!rate && days.length) {
+        // 直连与归档都失败时的最后兜底：用最近一个已归档交易日的「自家家数」。
+        // 优先 self（collect.js 新格式写的），没有才退回 rate（那会早一天，但已是最后的可用值）。
+        var lb = days[days.length - 1];
+        rate = (lb.self && lb.self.rate != null) ? lb.self : lb.rate;
+      }
+
+      // ---- 渲染 ----
+      state.rows = rows;
+      state.rate = rate;
+
+      // 5 日图的数据源 = 仓库存档 + 「当天直连」。
+      // 当天的存档要等收盘后 Actions 才写回仓库，页面不必等它：
+      // 直连已经拿到当天完整分时（收盘后末点即收盘值），直接并进 5 日图，
+      // 当天那根线立刻就有，定时任务跑不跑都不影响阅读。
+      var chartDays = days.slice();
+      if (!archived && rows.length && dataDate && rate) {
+        var dStr = fmtDateNum(dataDate);
+        var dup = false;
+        for (var ci = 0; ci < chartDays.length; ci++) {
+          if (chartDays[ci].date === dStr) { dup = true; break; }
+        }
+        if (!dup) {
+          chartDays.push({
+            date: dStr, rate: rate, live: true,
+            points: rows.map(function (r) {
+              return { t: r.t, a: r.pct, b: r.bPct, c: r.cPct };
+            })
+          });
+        }
+      }
+      if (chartDays.length > DAYS_5D) chartDays = chartDays.slice(-DAYS_5D);
+      state.chartDays = chartDays;
+
+      if (rate) {
+        var tag = rate.src === 'live' ? '' : '［存档］';
+        // 手机版第三个数字：只显示百分比本身。
+        // 口径细节挪到 title（长按可见），版面上一律不出现说明文字。
+        var fblTxt = rate.fbl == null ? '　' : rate.fbl.toFixed(2) + '%';
+        setText('fblText', fblTxt);
+        var fbEl = document.getElementById('fblText');
+        if (fbEl) {
+          fbEl.title = '昨日非一字板封板率 ' + fblTxt +
+            '（' + rate.base + '/' + (rate.base + rate.zb) +
+            '，剔除一字板 ' + rate.oneWord + ' 家，炸板率 ' +
+            (rate.zbl == null ? '--' : rate.zbl.toFixed(2) + '%') +
+            '，基准日 ' + rate.date + '）' + tag;
+          fbEl.className = 'v ' + clsRate(rate.fbl) + (tag ? ' stale' : '');
+        }
+      } else {
+        setText('fblText', '　');
+      }
+
+      // 顶部数值统一取「三个输入量都齐」的最后一个点，避免 883918 比分时慢一拍时出现空值。
+      // 若 883918 整段缺失，则退回到只要求 883900 + 上证（此时指数②显示 --）。
+      var lastAll = null, lastAB = null;
+      for (var ri = rows.length - 1; ri >= 0; ri--) {
+        var r0 = rows[ri];
+        if (lastAB === null && r0.pct != null && r0.bPct != null) lastAB = r0;
+        if (r0.pct != null && r0.bPct != null && r0.cPct != null) { lastAll = r0; break; }
+      }
+      var last = lastAll || lastAB;
+
+      // 指数①（权重 = 昨日非一字板封板率；取不到时显示 --）
+      var vEl = document.getElementById('curValue');
+      var dEl = document.getElementById('curDelta');
+      var cur = (last && rate) ? metric(rate.fbl, last.pct, last.bPct) : null;
+      if (cur != null && isFinite(cur)) {
+        if (vEl) { vEl.textContent = cur.toFixed(4); vEl.className = 'v ' + cls1(cur); }
+        if (dEl) {
+          var dev = (cur - 1) * 100;
+          dEl.textContent = (dev >= 0 ? '+' : '') + dev.toFixed(3) + ' 相对基准';
+          dEl.className = 'd ' + cls1(cur);
+        }
+        setTitleValue(cur);          // 同步到标签栏（后台也能瞄到当前值）
+      } else {
+        if (vEl) { vEl.textContent = '--'; vEl.className = 'v flat'; }
+        if (dEl) { dEl.textContent = '--'; dEl.className = 'd flat'; }
+        setTitleValue(null);
+      }
+
+      // 指数②
+      var v2El = document.getElementById('curValue2');
+      var d2El = document.getElementById('curDelta2');
+      var cur2 = (lastAll && rate && rate.fbl != null) ? metric2(lastAll.cPct, lastAll.pct, rate.fbl) : null;
+      if (cur2 == null) {
+        if (v2El) { v2El.textContent = '--'; v2El.className = 'v flat'; }
+        if (d2El) { d2El.textContent = '--'; d2El.className = 'd flat'; }
+      } else {
+        if (v2El) { v2El.textContent = cur2.toFixed(2); v2El.className = 'v ' + cls2(cur2); }
+        if (d2El) {
+          d2El.textContent = (cur2 >= 0 ? '+' : '') + cur2.toFixed(2) + ' 元/万（0 = 不赚不亏）';
+          d2El.className = 'd ' + cls2(cur2);
+        }
+      }
+
+      if (last) {
+        setText('aText', fmtPct(last.pct));
+        setText('shText', fmtPct(last.bPct));
+        setText('cText', lastAll ? fmtPct(lastAll.cPct) : '--');
+        setText('lastPoint', last.t + (lastAll && lastAll.t !== last.t ? '（883918 到 ' + lastAll.t + '）' : ''));
+      }
+
+      // 今日实时封板率：贴在 ①② 数值后面（已在上面取过，这里只负责渲染）
+      renderTodayRate(todayLive);
+
+      // 按当前选中的视图（1日 / 5日）绘制两张图
+      renderAll();
+
+      if (dataDate) {
+        setText('quoteTime', dataDate.slice(0, 4) + '-' + dataDate.slice(4, 6) + '-' + dataDate.slice(6, 8));
+      }
+
+      if (dot) dot.className = 'dot on';
+      /* 五种状态分开说，别让用户自己猜：
+       *   盘中     —— 当天分时在跑
+       *   集合竞价已结束（09:25–09:30）—— 今日行情已开始，靠 realhead 给的开盘读数
+       *   盘前 / 集合竞价中 —— 今天还没出数据，显示上一交易日
+       *   盘后     —— 当天已收盘，分时是完整的 */
+      var minsNow = minsOf(now);
+      var inAucDone = isWeekday(now) && minsNow >= AUCTION_END && minsNow < OPEN_MIN;
+      var isPre = isWeekday(now) && minsNow < AUCTION_START;
+      var isAuction = isWeekday(now) && minsNow >= AUCTION_START && minsNow < AUCTION_END;
+
+      var stateTxt;
+      if (inSession(now)) {
+        stateTxt = '盘中';
+      } else if (inAucDone) {
+        stateTxt = usedOpening ? '竞价结束' : '等待开盘';
+      } else if (isAuction) {
+        stateTxt = '竞价中 · 上一交易日';
+      } else if (isPre) {
+        stateTxt = '盘前 · 上一交易日';
+      } else {
+        stateTxt = '已收盘';
+      }
+
+      // 数据末点比当前时间落后 3 分钟以上 → 直接写明「数据停在几点」，
+      // 免得页面看着在刷新、其实曲线没动（浏览器缓存 / 网络中间层都会造成）。
+      // 09:25–09:30 只一个开盘点，谈不上「停留」，跳过。
+      var staleTxt = '';
+      if (last && inSession(now) && !usedOpening) {
+        var lm = parseInt(last.t.slice(0, 2), 10) * 60 + parseInt(last.t.slice(3, 5), 10);
+        if (isFinite(lm) && minsNow - lm >= 3) staleTxt = '　⚠ 停在 ' + last.t;
+      }
+
+      setText('liveText', stateTxt +
+        (archived ? '　存档' : '') + staleTxt);
+
+    } catch (e) {
+      if (dot) dot.className = 'dot err';
+      setText('liveText', '连接异常');
+      if (errBox) errBox.textContent = '数据获取失败（' + e.message + '），将在下一轮自动重试。';
+    } finally {
+      busy = false;
+      left = REFRESH_SEC;
+    }
+  }
+
+  /* ---- 标签页标题显示实时指标 ----
+   * 后台标签页看不到内容，但标签栏上的文字看得见。把①的当前值写进 title，
+   * 切去别的标签也能瞄一眼，不必切回来。取不到数时还原成原标题。 */
+  var TITLE_ORIG = document.title;
+  function setTitleValue(cur) {
+    if (cur == null || !isFinite(cur)) { document.title = TITLE_ORIG; return; }
+    // ▲/▼/＝ 只是方向标记：标签栏没法着色，用符号补上「红涨绿跌」缺失的信息
+    var mark = cur > 1.0000001 ? '▲' : (cur < 0.9999999 ? '▼' : '＝');
+    document.title = cur.toFixed(4) + ' ' + mark + ' · 打板';
+  }
+
+  /* ---- 后台不被节流的 1 秒心跳 ----
+   * 主线程的 setInterval 在后台标签页会被强制放慢：
+   *   隐藏 <5 分钟 → 最快 1 秒一次；隐藏 >5 分钟且是链式定时器 → 每分钟才检查一次。
+   * 这是 HTML 规范里的主动节流（为了省电），前端改不掉。
+   * 但规范**明确豁免了 Web Worker 内部的定时器**（Worker 在独立线程，不参与主线程节流），
+   * 于是把心跳搬进 Worker：后台也能按 60 秒的节奏取数，切回来的第一帧就已经是新数据。
+   * 注意：Worker 只能用 blob: URL 创建，file:// 协议或严格 CSP 下会失败 → 回退主线程 setInterval。
+   */
+  function startHeartbeat(onBeat) {
+    var worker = null, fallbackId = null, beat = false;
+    function hit() { beat = true; onBeat(); }
+    function toFallback(why) {
+      if (fallbackId) return;
+      try { if (worker) worker.terminate(); } catch (e) { /* 忽略 */ }
+      worker = null;
+      fallbackId = setInterval(hit, 1000);
+      try {
+        console.info('[心跳] 回退主线程 setInterval（' + why + '）——后台标签页会被浏览器放慢');
+      } catch (e) { /* 忽略 */ }
+    }
+    try {
+      var code = 'var id = setInterval(function () { postMessage(1); }, 1000);' +
+        'self.onmessage = function (e) { if (e.data === "stop") clearInterval(id); };';
+      var url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+      worker = new Worker(url);
+      worker.onmessage = hit;
+      worker.onerror = function () { toFallback('Worker onerror'); };
+      // 3 秒还没收到一次心跳 → 说明 Worker 没跑起来，直接换主线程（有些环境 onerror 不触发）
+      setTimeout(function () {
+        if (!beat) { toFallback('3 秒内没有心跳'); return; }
+        try { console.info('[心跳] 使用 Web Worker（后台标签页不被节流）'); } catch (e) { /* 忽略 */ }
+      }, 3000);
+    } catch (e) {
+      toFallback('Worker 创建失败：' + e.message);
+    }
+    return function stop() {
+      if (worker) { try { worker.postMessage('stop'); worker.terminate(); } catch (e) {} }
+      if (fallbackId) clearInterval(fallbackId);
+    };
+  }
+
+  /* ---- 关键时刻到点强制刷新 ----
+   * 心跳周期是 60 秒，若不干预，「09:25 翻成今天」可能拖到 09:25:59 才生效。
+   * 09:25（集合竞价撮合）与 09:30（连续竞价开始）这两个点必须准，到点就把倒计时清零。 */
+  var lastForcedKey = '';
+  function forceAtMilestone(now) {
+    var m = minsOf(now);
+    // 09:25 撮合、09:30 开盘、09:31（分时首点此刻必定已到位，补一发确保曲线接上）
+    if (m !== AUCTION_END && m !== OPEN_MIN && m !== OPEN_MIN + 1) return;
+    var key = ymdOfBJ(now) + '@' + m;
+    if (key === lastForcedKey) return;
+    lastForcedKey = key;
+    left = 0;
+  }
+
+  /* ---- 每秒心跳：走本地时钟 + 倒计时 ---- */
+  var lastBeatAt = 0;
+  function tick() {
+    var now = bjNow();
+    setText('localTime', hmOf(now) + ':' + pad(now.getUTCSeconds()));
+    forceAtMilestone(now);
+
+    // 按「真实经过的秒数」递减，而不是无脑 -1：
+    // 标签被冻结、电脑睡眠、或者心跳本身被拖慢时，回来会一次性补齐，
+    // 不会出现「明明过了 10 分钟，倒计时却只从 60 掉到 59」。
+    var t = Date.now();
+    var dt = lastBeatAt ? Math.max(0, Math.round((t - lastBeatAt) / 1000)) : 1;
+    lastBeatAt = t;
+
+    left -= dt;
+    if (left <= 0) {
+      setText('countdown', '—');
+      refresh();                 // busy 时内部会自行挡掉，不会叠加请求
+    } else {
+      setText('countdown', left);
+    }
+  }
+
+  /* ==================== 启动 ==================== */
+  bindTabs();
+  refresh();
+  var stopHeartbeat = startHeartbeat(tick);
+
+  // 手机横竖屏切换 / 桌面拖窗口后要重新排版：
+  // 图表的 grid 留白、刻度字号、5 日图的标签密度都是按 innerWidth 算的，
+  // 只调 resize() 不重画的话标签会一直是切换前那套。防抖 250ms 避免拖动时疯狂重绘。
+  var relayoutTimer = null;
+  window.addEventListener('resize', function () {
+    if (relayoutTimer) clearTimeout(relayoutTimer);
+    relayoutTimer = setTimeout(function () {
+      relayoutTimer = null;
+      for (var k in charts) { if (charts[k]) charts[k].resize(); }
+      renderAll();
+    }, 250);
+  });
+
+  // 兜底一：切回前台立刻补一次刷新，不必干等满一个 60 秒周期。
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) return;
+    left = 0;
+    lastBeatAt = 0;
+    setText('countdown', '—');
+    refresh();
+  });
+  // 兜底二：断网恢复后立刻重试
+  window.addEventListener('online', function () { left = 0; lastBeatAt = 0; refresh(); });
+  // 页面卸载时收掉 Worker / 定时器，避免残留
+  window.addEventListener('beforeunload', function () { stopHeartbeat(); });
+})();
